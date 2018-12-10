@@ -33,7 +33,7 @@ const unsigned c_handleTimeoutsIntervalMs = 5000;
 
 }  // namespace
 
-std::chrono::seconds const DiscoveryDatagram::c_timeToLive{60};
+std::chrono::seconds const DiscoveryDatagram::c_timeToLive{20};
 std::chrono::milliseconds const NodeTable::c_evictionCheckInterval{75};
 std::chrono::milliseconds const NodeTable::c_reqTimeout{300};
 std::chrono::milliseconds const NodeTable::c_bucketRefresh{7200};
@@ -55,6 +55,7 @@ NodeTable::NodeTable(
     m_socket(make_shared<NodeSocket>(
         _io, *reinterpret_cast<UDPSocketEvents*>(this), (bi::udp::endpoint)m_hostNode.endpoint)),
     m_socketPointer(m_socket.get()),
+    m_requestTimeToLive(DiscoveryDatagram::c_timeToLive),
     m_timers(_io)
 {
     for (unsigned i = 0; i < s_bins; i++)
@@ -184,6 +185,7 @@ void NodeTable::doDiscover(NodeID _node, unsigned _round, shared_ptr<set<shared_
             auto r = nearest[i];
             tried.push_back(r);
             FindNode p(r->endpoint, _node);
+            p.ts = nextRequestExpirationTime();
             p.sign(m_secret);
             DEV_GUARDED(x_findNodeTimeout)
                 m_findNodeTimeout.push_back(make_pair(r->id, chrono::steady_clock::now()));
@@ -288,6 +290,7 @@ void NodeTable::ping(NodeEntry const& _nodeEntry)
         NodeIPEndpoint src;
         DEV_GUARDED(x_nodes) { src = m_hostNode.endpoint; }
         PingNode p(src, _nodeEntry.endpoint);
+        p.ts = nextRequestExpirationTime();
         auto const pingHash = p.sign(m_secret);
 	    LOG(m_logger) << "Sending " << p.typeName() << " to " << _nodeEntry.id << "@" << p.destination;
         m_socketPointer->send(p);
@@ -509,6 +512,7 @@ void NodeTable::onPacketReceived(
                 for (unsigned offset = 0; offset < nearest.size(); offset += nlimit)
                 {
                     Neighbours out(_from, nearest, offset, nlimit);
+                    out.ts = nextRequestExpirationTime();
                     LOG(m_logger) << "Sending " << out.typeName() << " to " << in.sourceid << "@" << _from;
                     out.sign(m_secret);
                     if (out.data.size() > 1280)
@@ -527,6 +531,7 @@ void NodeTable::onPacketReceived(
                 
                 Pong p(in.source);
                 LOG(m_logger) << "Sending " << p.typeName() << " to " << in.sourceid << "@" << _from;
+                p.ts = nextRequestExpirationTime();
                 p.echo = in.echo;
                 p.sign(m_secret);
                 m_socketPointer->send(p);
@@ -626,7 +631,7 @@ void NodeTable::doHandleTimeouts()
 
         for (auto it = m_sentPings.begin(); it != m_sentPings.end();)
         {
-            if (chrono::steady_clock::now() > it->second.first + DiscoveryDatagram::c_timeToLive)
+            if (chrono::steady_clock::now() > it->second.first + m_requestTimeToLive)
             {
                 if (auto node = nodeEntry(it->first))
                     dropNode(node);

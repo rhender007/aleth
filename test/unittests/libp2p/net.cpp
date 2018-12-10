@@ -162,8 +162,10 @@ struct TestNodeTable: public NodeTable
     using NodeTable::m_buckets;
     using NodeTable::m_evictions;
     using NodeTable::m_hostNode;
+    using NodeTable::m_sentPings;
     using NodeTable::m_socket;
     using NodeTable::noteActiveNode;
+    using NodeTable::setRequestTimeToLive;
 };
 
 /**
@@ -454,8 +456,9 @@ BOOST_AUTO_TEST_CASE(unsolicitedPong)
     // NodeTable receiving PONG
     TestNodeTableHost nodeTableHost(0);
     nodeTableHost.start();
+    auto& nodeTable = nodeTableHost.nodeTable;
 
-    Pong pong(nodeTableHost.nodeTable->m_hostNode.endpoint);
+    Pong pong(nodeTable->m_hostNode.endpoint);
     auto nodeKeyPair = KeyPair::create();
     pong.sign(nodeKeyPair.secret());
 
@@ -464,10 +467,10 @@ BOOST_AUTO_TEST_CASE(unsolicitedPong)
     a.socket->send(pong);
 
     // wait for PONG to be received and handled
-    nodeTableHost.nodeTable->packetReceived.get_future().wait();
+    nodeTable->packetReceived.get_future().wait();
 
-    auto addedNode = nodeTableHost.nodeTable->m_allNodes.find(nodeKeyPair.pub());
-    BOOST_REQUIRE(addedNode == nodeTableHost.nodeTable->m_allNodes.end());
+    auto addedNode = nodeTable->m_allNodes.find(nodeKeyPair.pub());
+    BOOST_REQUIRE(addedNode == nodeTable->m_allNodes.end());
 }
 
 BOOST_AUTO_TEST_CASE(invalidPong)
@@ -475,6 +478,7 @@ BOOST_AUTO_TEST_CASE(invalidPong)
     // NodeTable sending PING
     TestNodeTableHost nodeTableHost(0);
     nodeTableHost.start();
+    auto& nodeTable = nodeTableHost.nodeTable;
 
     // socket answering with PONG
     TestUDPSocketHost nodeSocketHost{30500};
@@ -485,19 +489,19 @@ BOOST_AUTO_TEST_CASE(invalidPong)
     auto nodeEndpoint = NodeIPEndpoint{bi::address::from_string("127.0.0.1"), nodePort, nodePort};
     auto nodeKeyPair = KeyPair::create();
     auto nodePubKey = nodeKeyPair.pub();
-    nodeTableHost.nodeTable->addNode(Node{nodePubKey, nodeEndpoint});
+    nodeTable->addNode(Node{nodePubKey, nodeEndpoint});
 
     // send PONG
-    Pong pong(nodeTableHost.nodeTable->m_hostNode.endpoint);
+    Pong pong(nodeTable->m_hostNode.endpoint);
     pong.sign(nodeKeyPair.secret());
 
     nodeSocketHost.socket->send(pong);
 
     // wait for PONG to be received and handled
-    nodeTableHost.nodeTable->packetReceived.get_future().wait();
+    nodeTable->packetReceived.get_future().wait();
 
-    auto addedNode = nodeTableHost.nodeTable->m_allNodes.find(nodePubKey);
-    BOOST_REQUIRE(addedNode != nodeTableHost.nodeTable->m_allNodes.end());
+    auto addedNode = nodeTable->m_allNodes.find(nodePubKey);
+    BOOST_REQUIRE(addedNode != nodeTable->m_allNodes.end());
     BOOST_CHECK_EQUAL(addedNode->second->lastPongReceivedTime, 0);
 }
 
@@ -506,6 +510,7 @@ BOOST_AUTO_TEST_CASE(validPong)
     // NodeTable sending PING
     TestNodeTableHost nodeTableHost(0);
     nodeTableHost.start();
+    auto& nodeTable = nodeTableHost.nodeTable;
 
     // socket receiving PING
     TestUDPSocketHost nodeSocketHost{30500};
@@ -516,7 +521,7 @@ BOOST_AUTO_TEST_CASE(validPong)
     auto nodeEndpoint = NodeIPEndpoint{bi::address::from_string("127.0.0.1"), nodePort, nodePort};
     auto nodeKeyPair = KeyPair::create();
     auto nodePubKey = nodeKeyPair.pub();
-    nodeTableHost.nodeTable->addNode(Node{nodePubKey, nodeEndpoint});
+    nodeTable->addNode(Node{nodePubKey, nodeEndpoint});
 
     // handle received PING
     auto pingDataReceived = nodeSocketHost.packetReceived.get_future().get();
@@ -525,17 +530,65 @@ BOOST_AUTO_TEST_CASE(validPong)
     auto ping = dynamic_cast<PingNode const&>(*pingDatagram);
 
     // send PONG
-    Pong pong(nodeTableHost.nodeTable->m_hostNode.endpoint);
+    Pong pong(nodeTable->m_hostNode.endpoint);
     pong.echo = ping.echo;
     pong.sign(nodeKeyPair.secret());
     nodeSocketHost.socket->send(pong);
 
     // wait for PONG to be received and handled
-    nodeTableHost.nodeTable->packetReceived.get_future().wait();
+    nodeTable->packetReceived.get_future().wait();
 
-    auto addedNode = nodeTableHost.nodeTable->m_allNodes.find(nodePubKey);
-    BOOST_REQUIRE(addedNode != nodeTableHost.nodeTable->m_allNodes.end());
+    auto addedNode = nodeTable->m_allNodes.find(nodePubKey);
+    BOOST_REQUIRE(addedNode != nodeTable->m_allNodes.end());
     BOOST_CHECK(addedNode->second->lastPongReceivedTime > 0);
+}
+
+BOOST_AUTO_TEST_CASE(pingTimeout)
+{
+    // NodeTable sending PING
+    TestNodeTableHost nodeTableHost(0);
+
+    nodeTableHost.start();
+    auto& nodeTable = nodeTableHost.nodeTable;
+    nodeTable->setRequestTimeToLive(std::chrono::seconds(1));
+
+    // socket receiving PING
+    TestUDPSocketHost nodeSocketHost{30500};
+    nodeSocketHost.start();
+    uint16_t nodePort = nodeSocketHost.port;
+
+    // add a node to node table, initiating PING
+    auto nodeEndpoint = NodeIPEndpoint{bi::address::from_string("127.0.0.1"), nodePort, nodePort};
+    auto nodeKeyPair = KeyPair::create();
+    auto nodePubKey = nodeKeyPair.pub();
+    nodeTable->addNode(Node{nodePubKey, nodeEndpoint});
+
+    this_thread::sleep_for(std::chrono::seconds(6));
+
+    auto addedNode = nodeTable->m_allNodes.find(nodePubKey);
+    BOOST_CHECK(addedNode == nodeTable->m_allNodes.end());
+    auto sentPing = nodeTable->m_sentPings.find(nodePubKey);
+    BOOST_CHECK(sentPing == nodeTable->m_sentPings.end());
+
+    // handle received PING
+    auto pingDataReceived = nodeSocketHost.packetReceived.get_future().get();
+    auto pingDatagram =
+        DiscoveryDatagram::interpretUDP(bi::udp::endpoint{}, dev::ref(pingDataReceived));
+    auto ping = dynamic_cast<PingNode const&>(*pingDatagram);
+
+    // send PONG after timeout
+    Pong pong(nodeTable->m_hostNode.endpoint);
+    pong.echo = ping.echo;
+    pong.sign(nodeKeyPair.secret());
+    nodeSocketHost.socket->send(pong);
+
+    // wait for PONG to be received and handled
+    nodeTable->packetReceived.get_future().wait();
+
+    addedNode = nodeTable->m_allNodes.find(nodePubKey);
+    BOOST_CHECK(addedNode == nodeTable->m_allNodes.end());
+    sentPing = nodeTable->m_sentPings.find(nodePubKey);
+    BOOST_CHECK(sentPing == nodeTable->m_sentPings.end());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
